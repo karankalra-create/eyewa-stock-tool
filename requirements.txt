@@ -1,3 +1,5 @@
 streamlit>=1.49
 pandas>=2.0
 openpyxl>=3.1
+requests>=2.31
+PyJWT[crypto]>=2.8
