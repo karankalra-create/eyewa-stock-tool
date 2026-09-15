@@ -65,7 +65,17 @@ quantity column or renames its sheet, update that platform's entry in `PLATFORMS
 The 6th Street CSV export mangles 13-digit barcode SKUs into scientific notation
 (`8.80954E+12`), which is lossy: eleven distinct barcodes collapse to one string. This tool
 sidesteps it by building the 6th Street file from the master sheet, which holds the true
-barcodes, so the output never inherits the corruption.
+barcodes, so the output never inherits the corruption — the `Sku` column in the generated
+CSV always holds clean plain digits (e.g. `6290360089133`), never scientific notation or a
+trailing `.0`.
+
+That said, if you open the generated CSV by double-clicking it in Excel, Excel will
+auto-convert those same long digit strings back into scientific notation for **display only**
+— this is a well-known Excel CSV quirk and has no CSV-only fix, since plain CSV carries no
+per-cell formatting. It does not change the underlying file, and it does not affect what
+6th Street's importer reads (it parses the raw text, not Excel's rendering). To inspect the
+file without triggering this, use Excel's **Data → From Text/CSV** and set the `Sku` column
+type to **Text** before loading, instead of opening it directly.
 
 ## Layout
 

@@ -179,6 +179,17 @@ if "out" in st.session_state:
             f"⬇  {p.label}", payload, file_name=fname, key=f"dl_{key}", width="stretch"
         )
 
+    if "sixth_street" in results:
+        st.caption(
+            "⚠️ The 6th Street file has 13-digit barcode SKUs (e.g. 6290360089133). "
+            "The data in the CSV is correct plain digits — but if you double-click it "
+            "open in Excel, Excel auto-converts long digit strings to scientific "
+            "notation (6.29036E+12) for display only. This is cosmetic and doesn't "
+            "affect what gets uploaded. To check the file safely, use Excel's "
+            "**Data → From Text/CSV** and set the Sku column type to **Text** before "
+            "loading, rather than opening it directly."
+        )
+
     zbuf = io.BytesIO()
     with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
         for key, (plan, payload) in results.items():
