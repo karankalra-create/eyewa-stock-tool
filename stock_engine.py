@@ -1,15 +1,16 @@
 """
-Eyewa KSA marketplace stock upload engine.
+Eyewa marketplace stock upload engine -- multi-region (KSA, UAE, ...).
 
 Pure logic, no Streamlit imports, so it can be unit-tested or driven from a script.
 
 Pipeline
 --------
-raw WMS inventory snapshot
-  -> sellable filter (blocked / location type / excluded locations)
+raw WMS inventory snapshot (one region)
+  -> sellable filter (blocked / location type / region's excluded locations)
   -> merge duplicate SKUs (case-insensitive)
-  -> per platform: master-file SKU list + per-SKU threshold
-  -> filled platform template, byte-for-byte in the platform's own format
+  -> per platform: region's master-file SKU list + per-SKU threshold
+  -> filled platform template, byte-for-byte in the platform's own format,
+     using that region's own template file (and worksheet, where it differs)
 """
 
 from __future__ import annotations
@@ -25,24 +26,81 @@ import pandas as pd
 HERE = os.path.dirname(os.path.abspath(__file__))
 REFERENCE_DIR = os.path.join(HERE, "reference")
 TEMPLATE_DIR = os.path.join(REFERENCE_DIR, "templates")
-DEFAULT_MASTER = os.path.join(REFERENCE_DIR, "master_file.xlsx")
 
 # --------------------------------------------------------------------------
 # Sellable-stock rules
 # --------------------------------------------------------------------------
 
-#: Only these location types hold sellable stock.
+#: Only these location types hold sellable stock, in every region.
 SELLABLE_LOCATION_TYPES = {"BULK", "PICK_FACE"}
 
-#: Locations that never hold sellable stock, regardless of location type.
+
+def _load_location_list(filename: str) -> frozenset[str]:
+    """One location code per line -> an upper-cased set for case-insensitive matching."""
+    path = os.path.join(REFERENCE_DIR, filename)
+    with open(path, encoding="utf-8") as f:
+        return frozenset(
+            line.strip().upper() for line in f if line.strip()
+        )
+
+
+#: KSA locations that never hold sellable stock, regardless of location type.
 #: Matched case-insensitively -- the WMS holds case variants of the same bin
 #: (Default/default, MIS-RIY/mis-riy, WH-EXP/wh-exp, ...).
-EXCLUDED_LOCATIONS = {
+KSA_EXCLUDED_LOCATIONS = frozenset({
     "DEFAULT", "MIS-RIY", "OF-07-5-5", "OF-07-7-9", "QSCRIY",
     "RF-04-1-1", "RF-04-3-1", "RF-05-2-1", "RF-05-3-1",
     "WH-EXP", "WH-MISS", "WH-OTH-DAM", "WH-RE-REFURB", "WMS-DF",
     "WB-1-1-1", "WH-3PL", "WH-SUP-DAM",
+})
+
+#: UAE locations that never hold sellable stock -- a much larger list (racking,
+#: cages and quarantine bins), kept in its own file since it's ~500 codes long.
+#: Loaded once at import time.
+UAE_EXCLUDED_LOCATIONS = _load_location_list("excluded_locations_uae.txt")
+
+#: Backwards-compatible alias (KSA was the only region before UAE was added).
+EXCLUDED_LOCATIONS = KSA_EXCLUDED_LOCATIONS
+
+
+# --------------------------------------------------------------------------
+# Region configuration
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Region:
+    key: str                              # internal id, e.g. "ksa"
+    label: str                            # shown in the UI, e.g. "KSA"
+    excluded_locations: frozenset[str]
+    master_file: str                      # bundled reference/<file>.xlsx
+    #: per-platform overrides where the region's own template file lives
+    #: under reference/templates/<region>/ instead of the shared name;
+    #: in practice every region has its own folder, so this is always set.
+    template_dir: str = ""
+    #: per-platform worksheet-name overrides, when a region's template
+    #: names its data sheet differently (e.g. Noon: "Noon KSA" vs "Noon UAE").
+    sheet_overrides: dict[str, str] = field(default_factory=dict)
+
+
+REGIONS: dict[str, Region] = {
+    "ksa": Region(
+        key="ksa", label="KSA",
+        excluded_locations=KSA_EXCLUDED_LOCATIONS,
+        master_file="master_ksa.xlsx",
+        template_dir="ksa",
+        sheet_overrides={},
+    ),
+    "uae": Region(
+        key="uae", label="UAE",
+        excluded_locations=UAE_EXCLUDED_LOCATIONS,
+        master_file="master_uae.xlsx",
+        template_dir="uae",
+        sheet_overrides={"noon": "Noon UAE", "namshi": "Final_UAE"},
+    ),
 }
+
+REGION_ORDER = ["ksa", "uae"]
 
 
 def _norm(value) -> str:
@@ -64,10 +122,10 @@ def _norm_header(value) -> str:
 class Platform:
     key: str                     # internal id
     label: str                   # shown in the UI
-    master_sheet: str            # sheet name in the master file
-    template: str                # bundled template filename
+    master_sheet: str            # sheet name in the master file (same across regions)
+    template: str                # template filename, under each region's own folder
     out_ext: str                 # extension of the produced file
-    sheet: str | None = None     # worksheet that holds the upload rows
+    sheet: str | None = None     # default worksheet holding the upload rows (region may override)
     sku_col: int | None = None   # 1-based column holding the platform SKU
     qty_col: int | None = None   # 1-based column that receives the quantity
     raw_col: int | None = None   # optional helper column receiving pre-threshold qty
@@ -151,7 +209,7 @@ class SellableResult:
     qty_basis: str = ""
 
 
-def build_sellable(df: pd.DataFrame) -> SellableResult:
+def build_sellable(df: pd.DataFrame, region: Region) -> SellableResult:
     """Apply the sellable filter and merge duplicate SKUs into one row each."""
     lookup = {_norm_header(c): c for c in df.columns}
     missing = [
@@ -191,7 +249,7 @@ def build_sellable(df: pd.DataFrame) -> SellableResult:
 
     work = work[
         ~work[col["location"]].astype(str).str.strip().str.upper()
-        .isin(EXCLUDED_LOCATIONS)
+        .isin(region.excluded_locations)
     ]
     res.rows_after_location = len(work)
 
@@ -236,9 +294,9 @@ def build_sellable(df: pd.DataFrame) -> SellableResult:
 # --------------------------------------------------------------------------
 
 
-def load_master(source=None) -> dict[str, pd.DataFrame]:
-    """Load the master item file, one DataFrame per platform sheet."""
-    source = source or DEFAULT_MASTER
+def load_master(region: Region, source=None) -> dict[str, pd.DataFrame]:
+    """Load the region's master item file, one DataFrame per platform sheet."""
+    source = source or os.path.join(REFERENCE_DIR, region.master_file)
     out: dict[str, pd.DataFrame] = {}
     for key in PLATFORM_ORDER:
         p = PLATFORMS[key]
@@ -309,8 +367,12 @@ def plan_platform(key: str, master: pd.DataFrame, sellable: dict[str, int]) -> P
 # --------------------------------------------------------------------------
 
 
-def _template_path(p: Platform) -> str:
-    return os.path.join(TEMPLATE_DIR, p.template)
+def _template_path(p: Platform, region: Region) -> str:
+    return os.path.join(TEMPLATE_DIR, region.template_dir, p.template)
+
+
+def _sheet_name(p: Platform, region: Region) -> str:
+    return region.sheet_overrides.get(p.key, p.sheet)
 
 
 def _build_csv(plan: PlatformPlan, master: pd.DataFrame) -> bytes:
@@ -328,16 +390,17 @@ def _build_csv(plan: PlatformPlan, master: pd.DataFrame) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 
-def _build_workbook(plan: PlatformPlan) -> bytes:
+def _build_workbook(plan: PlatformPlan, region: Region) -> bytes:
     """
-    Open the real platform template, drop rows the master file does not list,
-    and write the quantity into the platform's own quantity column. Every other
-    cell, sheet and piece of formatting is left exactly as the platform sent it.
+    Open the region's own platform template, drop rows the master file does not
+    list, and write the quantity into the platform's own quantity column. Every
+    other cell, sheet and piece of formatting is left exactly as the platform
+    sent it.
     """
     p = plan.platform
     keep_vba = p.template.endswith(".xlsm")
-    wb = openpyxl.load_workbook(_template_path(p), keep_vba=keep_vba)
-    ws = wb[p.sheet]
+    wb = openpyxl.load_workbook(_template_path(p, region), keep_vba=keep_vba)
+    ws = wb[_sheet_name(p, region)]
 
     drop: list[int] = []
     for r in range(p.first_row, ws.max_row + 1):
@@ -362,11 +425,11 @@ def _build_workbook(plan: PlatformPlan) -> bytes:
     return buf.getvalue()
 
 
-def build_output(key: str, plan: PlatformPlan, master: pd.DataFrame) -> bytes:
+def build_output(key: str, plan: PlatformPlan, master: pd.DataFrame, region: Region) -> bytes:
     p = PLATFORMS[key]
     if p.out_ext == ".csv":
         return _build_csv(plan, master)
-    return _build_workbook(plan)
+    return _build_workbook(plan, region)
 
 
 # --------------------------------------------------------------------------
@@ -374,14 +437,20 @@ def build_output(key: str, plan: PlatformPlan, master: pd.DataFrame) -> bytes:
 # --------------------------------------------------------------------------
 
 
-def run(raw_df: pd.DataFrame, platform_keys: list[str], master_source=None):
-    """Full pipeline. Returns (SellableResult, {key: (PlatformPlan, bytes)})."""
-    sellable = build_sellable(raw_df)
-    master = load_master(master_source)
+def run(
+    raw_df: pd.DataFrame,
+    platform_keys: list[str],
+    region_key: str,
+    master_source=None,
+):
+    """Full pipeline for one region. Returns (SellableResult, {key: (PlatformPlan, bytes)})."""
+    region = REGIONS[region_key]
+    sellable = build_sellable(raw_df, region)
+    master = load_master(region, master_source)
     results: dict[str, tuple[PlatformPlan, bytes]] = {}
     for key in platform_keys:
         plan = plan_platform(key, master[key], sellable.qty)
-        results[key] = (plan, build_output(key, plan, master[key]))
+        results[key] = (plan, build_output(key, plan, master[key], region))
     return sellable, results
 
 
